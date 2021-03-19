@@ -1,0 +1,456 @@
+#include "stm32f4xx.h"
+#include <stdio.h>
+#include <string.h>
+
+GPIO_InitTypeDef 	GPIO_InitStructure ;
+EXTI_InitTypeDef 	EXTI_InitStructure ;
+NVIC_InitTypeDef 	NVIC_InitStructure ;
+USART_InitTypeDef 	USART_InitStructure ;
+//TIM_InitTypeDef 	TIM_InitStructure ;
+TIM_TimeBaseInitTypeDef  TIM_TimeBaseStructure;
+TIM_OCInitTypeDef  TIM_OCInitStructure;
+
+static volatile uint32_t tim14_cnt;
+static volatile uint32_t tim1_cnt;
+static volatile uint8_t g_usart3_event = 0;
+static volatile char g_usart3_buf[64] = {0};
+static volatile uint32_t g_usart3_cnt = 0;
+
+#define PFout(n)	*((volatile uint32_t *)(0x42000000+(GPIOF_BASE+0x14-0x40000000)*32+(n)*4))
+#define PBout(n)	*((volatile uint32_t *)(0x42000000+(GPIOB_BASE+0x14-0x40000000)*32+(n)*4))
+#define PEout(n)	*((volatile uint32_t *)(0x42000000+(GPIOE_BASE+0x14-0x40000000)*32+(n)*4))
+#define PEin(n)		*((volatile uint32_t *)(0x42000000+(GPIOE_BASE+0x10-0x40000000)*32+(n)*4))
+
+#pragma import(__use_no_semihosting_swi)
+
+
+struct __FILE { int handle; /* Add whatever you need here */ };
+FILE __stdout;
+FILE __stdin;
+
+
+int fputc(int ch, FILE *f) 
+{
+		
+	
+	USART_SendData(USART1,ch);
+	while(USART_GetFlagStatus(USART1,USART_FLAG_TXE)==RESET);	
+	
+	return ch;
+}
+
+void _sys_exit(int return_code) {
+label: goto label; /* endless loop */
+}
+
+void delay_us(uint32_t n)
+{
+	SysTick->CTRL = 0; // Disable SysTick，关闭系统定时器后才能取配置
+	SysTick->LOAD = 21*n-1; 	// 填写计数值，就是我们的延时时间
+	SysTick->VAL = 0; 			// 清空标志位
+	SysTick->CTRL = 1; 			// 选中21MHz的时钟源，并开始让系统定时器工作
+	while ((SysTick->CTRL & 0x10000)==0);//等待计数完毕
+	SysTick->CTRL = 0; // 不再使用就关闭系统定时器
+}
+
+
+void delay_ms(uint32_t n)
+{
+
+	while(n--)
+	{
+		SysTick->CTRL = 0; // Disable SysTick，关闭系统定时器后才能取配置
+		SysTick->LOAD = 21000-1; 	// 填写计数值，就是我们的延时时间
+		SysTick->VAL = 0; 			// 清空标志位
+		SysTick->CTRL = 1; 			// 选中21MHz的时钟源，并开始让系统定时器工作
+		while ((SysTick->CTRL & 0x10000)==0);//等待计数完毕
+		
+	}
+	SysTick->CTRL = 0; // 不再使用就关闭系统定时器
+}
+
+
+void usart1_init(uint32_t baud)
+{
+	//打开端口A硬件时钟
+	RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_GPIOA, ENABLE );
+	
+	//打开串口1的硬件时钟
+	RCC_APB2PeriphClockCmd(RCC_APB2Periph_USART1, ENABLE );	
+	
+	//配置PA9和PA10引脚，为AF模式（复用功能模式）
+	GPIO_InitStructure.GPIO_Pin  = GPIO_Pin_9|GPIO_Pin_10;//指定第9根引脚 
+	GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AF ;//配置为复用功能模式
+	GPIO_InitStructure.GPIO_Speed =GPIO_Speed_50MHz ;//配置引脚的响应时间=1/100MHz .
+	//从高电平切换到低电平1/100MHz,速度越快，功耗会越高
+	GPIO_InitStructure.GPIO_OType = GPIO_OType_PP ;//推挽的输出模式，增加输出电流和灌电流的能力
+	GPIO_InitStructure.GPIO_PuPd  = GPIO_PuPd_NOPULL ;//不使能内部上下拉电阻
+	GPIO_Init(GPIOA ,&GPIO_InitStructure);
+
+
+	//将PA9和PA10的功能进行指定为串口1
+	GPIO_PinAFConfig(GPIOA,GPIO_PinSource9,GPIO_AF_USART1);
+	GPIO_PinAFConfig(GPIOA,GPIO_PinSource10,GPIO_AF_USART1);	
+	
+	//配置串口1的参数：波特率、数据位、校验位、停止位、流控制
+	USART_InitStructure.USART_BaudRate = baud;//波特率
+	USART_InitStructure.USART_WordLength = USART_WordLength_8b;//8位数据位
+	USART_InitStructure.USART_StopBits = USART_StopBits_1;//1个停止位
+	USART_InitStructure.USART_Parity = USART_Parity_No;//无校验
+	USART_InitStructure.USART_HardwareFlowControl = USART_HardwareFlowControl_None;//无硬件流控制
+	USART_InitStructure.USART_Mode = USART_Mode_Rx | USART_Mode_Tx;//允许串口发送和接收数据
+	USART_Init(USART1, &USART_InitStructure);
+	
+	
+	//使能串口1的接收中断
+	USART_ITConfig(USART1,USART_IT_RXNE,ENABLE);
+	
+	NVIC_InitStructure.NVIC_IRQChannel = USART1_IRQn;
+	NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 0;
+	NVIC_InitStructure.NVIC_IRQChannelSubPriority = 0;
+	NVIC_InitStructure.NVIC_IRQChannelCmd = ENABLE;
+	NVIC_Init(&NVIC_InitStructure);
+
+	
+	
+	//使能串口1工作
+	USART_Cmd(USART1, ENABLE);
+
+}
+
+
+
+void usart3_init(uint32_t baud)
+{
+	//打开端口B硬件时钟
+	RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_GPIOB, ENABLE );
+	
+	//打开串口3的硬件时钟
+	RCC_APB1PeriphClockCmd(RCC_APB1Periph_USART3, ENABLE );	
+	
+	//配置PB10和PB11引脚，为AF模式（复用功能模式）
+	GPIO_InitStructure.GPIO_Pin  = GPIO_Pin_10|GPIO_Pin_11;//指定第10 11根引脚 
+	GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AF ;//配置为复用功能模式
+	GPIO_InitStructure.GPIO_Speed =GPIO_Speed_50MHz ;//配置引脚的响应时间=1/100MHz .
+	//从高电平切换到低电平1/100MHz,速度越快，功耗会越高
+	GPIO_InitStructure.GPIO_OType = GPIO_OType_PP ;//推挽的输出模式，增加输出电流和灌电流的能力
+	GPIO_InitStructure.GPIO_PuPd  = GPIO_PuPd_NOPULL ;//不使能内部上下拉电阻
+	GPIO_Init(GPIOB ,&GPIO_InitStructure);
+
+
+	//将PB10和PB11的功能进行指定为串口1
+	GPIO_PinAFConfig(GPIOB,GPIO_PinSource10,GPIO_AF_USART3);
+	GPIO_PinAFConfig(GPIOB,GPIO_PinSource11,GPIO_AF_USART3);	
+	
+	//配置串口1的参数：波特率、数据位、校验位、停止位、流控制
+	USART_InitStructure.USART_BaudRate = baud;//波特率
+	USART_InitStructure.USART_WordLength = USART_WordLength_8b;//8位数据位
+	USART_InitStructure.USART_StopBits = USART_StopBits_1;//1个停止位
+	USART_InitStructure.USART_Parity = USART_Parity_No;//无校验
+	USART_InitStructure.USART_HardwareFlowControl = USART_HardwareFlowControl_None;//无硬件流控制
+	USART_InitStructure.USART_Mode = USART_Mode_Rx | USART_Mode_Tx;//允许串口发送和接收数据
+	USART_Init(USART3, &USART_InitStructure);
+	
+	
+	//使能串口3的接收中断
+	USART_ITConfig(USART3,USART_IT_RXNE,ENABLE);
+	
+	NVIC_InitStructure.NVIC_IRQChannel = USART3_IRQn;
+	NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 0;
+	NVIC_InitStructure.NVIC_IRQChannelSubPriority = 0;
+	NVIC_InitStructure.NVIC_IRQChannelCmd = ENABLE;
+	NVIC_Init(&NVIC_InitStructure);
+
+	
+	
+	//使能串口3工作
+	USART_Cmd(USART3, ENABLE);
+
+}
+
+
+void usart3_send_str(char *str)
+{
+	char *p = str;
+	
+	while(p && (*p!='\0'))
+	{
+	
+		USART_SendData(USART3,*p);
+		while(USART_GetFlagStatus(USART3,USART_FLAG_TXE)==RESET);
+
+		p++;
+	
+	}
+
+
+}
+
+void tim1_init(void)
+{
+	//打开TIM1的硬件时钟
+	RCC_APB2PeriphClockCmd(RCC_APB2Periph_TIM1, ENABLE);
+
+	
+	//配置TIM1的相关参数：计数值（决定定时时间）、分频值
+	//TIM14的硬件时钟频率=84000000/8400=10000Hz
+	//只要进行10000次计数，就是1秒时间的到达，也就是1Hz的频率输出
+	//只要进行10000/100次计数，就是1秒/100时间的到达，也就是100Hz的频率输出
+	TIM_TimeBaseStructure.TIM_Period = 10000/100-1;//计数值100-1，决定了输出频率为100Hz
+	TIM_TimeBaseStructure.TIM_Prescaler = 8400-1;//预分频，也就是第一次分频，当前8400分频，就是84MHz/8400
+	TIM_TimeBaseStructure.TIM_ClockDivision = 0;//时钟分频，也称之二次分频这个F407是不支持的，因此该参数是不会生效
+	TIM_TimeBaseStructure.TIM_CounterMode = TIM_CounterMode_Up;//就是从0开始计数，然后计数到TIM_Period
+	tim1_cnt = TIM_TimeBaseStructure.TIM_Period+1;
+	TIM_TimeBaseInit(TIM1, &TIM_TimeBaseStructure);
+	
+	//占空比的配置
+	
+	TIM_OCInitStructure.TIM_OCMode = TIM_OCMode_PWM1;				//工作在PWM1模式
+	TIM_OCInitStructure.TIM_OutputState = TIM_OutputState_Enable;	//脉冲的输出开关，当前是输出脉冲
+	TIM_OCInitStructure.TIM_Pulse = tim1_cnt;		//这个值是决定了占空比，配置比较值
+	TIM_OCInitStructure.TIM_OCPolarity = TIM_OCPolarity_High;//有效的状态为高电平
+	
+	//TIM1的通道3配置
+	TIM_OC3Init(TIM1, &TIM_OCInitStructure);
+	
+	//使能定时器1工作
+	TIM_Cmd(TIM1, ENABLE);
+	
+	//TIM1的所有通道总开关的控制，当前为打开状态
+	TIM_CtrlPWMOutputs(TIM1,ENABLE);
+}
+
+void tim1_set_freq(uint32_t freq)
+{
+    /*定时器的基本配置，用于配置定时器的输出脉冲的频率为 freq Hz */
+    TIM_TimeBaseStructure.TIM_Period = (10000/freq)-1; //设置定时脉冲的频率
+    TIM_TimeBaseStructure.TIM_Prescaler = 8400-1; //第一次分频，简称为预分频
+    TIM_TimeBaseStructure.TIM_CounterMode = TIM_CounterMode_Up;
+    tim1_cnt= TIM_TimeBaseStructure.TIM_Period;
+    TIM_TimeBaseInit(TIM1, &TIM_TimeBaseStructure);
+}
+
+void tim1_set_duty(uint32_t duty)
+{
+	TIM_SetCompare3(TIM1,(tim1_cnt+1) * duty/100);
+}
+
+
+void tim14_init(void)
+{
+	//打开TIM14的硬件时钟
+	RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM14, ENABLE);
+
+	
+	//配置TIM14的相关参数：计数值（决定定时时间）、分频值
+	//TIM14的硬件时钟频率=84000000/8400=10000Hz
+	//只要进行10000次计数，就是1秒时间的到达，也就是1Hz的频率输出
+	//只要进行10000/100次计数，就是1秒/100时间的到达，也就是100Hz的频率输出
+	TIM_TimeBaseStructure.TIM_Period = 10000/100-1;//计数值100-1，决定了输出频率为100Hz
+	TIM_TimeBaseStructure.TIM_Prescaler = 8400-1;//预分频，也就是第一次分频，当前8400分频，就是84MHz/8400
+	TIM_TimeBaseStructure.TIM_ClockDivision = 0;//时钟分频，也称之二次分频这个F407是不支持的，因此该参数是不会生效
+	TIM_TimeBaseStructure.TIM_CounterMode = TIM_CounterMode_Up;//就是从0开始计数，然后计数到TIM_Period
+	tim14_cnt = TIM_TimeBaseStructure.TIM_Period+1;
+	TIM_TimeBaseInit(TIM14, &TIM_TimeBaseStructure);
+	
+	//占空比的配置
+	
+	TIM_OCInitStructure.TIM_OCMode = TIM_OCMode_PWM1;				//工作在PWM1模式
+	TIM_OCInitStructure.TIM_OutputState = TIM_OutputState_Enable;	//脉冲的输出开关，当前是输出脉冲
+	TIM_OCInitStructure.TIM_Pulse = tim14_cnt;		//这个值是决定了占空比，配置比较值
+	TIM_OCInitStructure.TIM_OCPolarity = TIM_OCPolarity_High;//有效的状态为高电平
+	
+	//TIM14的通道1配置
+	TIM_OC1Init(TIM14, &TIM_OCInitStructure);
+	
+	//使能定时器14工作
+	TIM_Cmd(TIM14, ENABLE);
+}
+
+void tim14_set_freq(uint32_t freq)
+{
+    /*定时器的基本配置，用于配置定时器的输出脉冲的频率为 freq Hz */
+    TIM_TimeBaseStructure.TIM_Period = (10000/freq)-1; //设置定时脉冲的频率
+    TIM_TimeBaseStructure.TIM_Prescaler = 8400-1; //第一次分频，简称为预分频
+    TIM_TimeBaseStructure.TIM_CounterMode = TIM_CounterMode_Up;
+    tim14_cnt= TIM_TimeBaseStructure.TIM_Period;
+    TIM_TimeBaseInit(TIM14, &TIM_TimeBaseStructure);
+}
+
+void tim14_set_duty(uint32_t duty)
+{
+	TIM_SetCompare1(TIM14,(tim14_cnt+1) * duty/100);
+}
+
+
+int main(void )
+{
+	char *s = NULL;
+	uint32_t duty_tmp, duty_num;
+	//打开端口E的硬件时钟，等同于对端口E供电
+	RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_GPIOE, ENABLE );
+	
+	//打开端口F的硬件时钟，等同于对端口F供电
+	RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_GPIOF, ENABLE );
+	
+	//初始化对应端口的引脚 
+	GPIO_InitStructure.GPIO_Pin  = GPIO_Pin_13;// F9、F10，LED0，LED1
+	GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AF ;//配置为输出模式
+	GPIO_InitStructure.GPIO_Speed =GPIO_Speed_50MHz ;//配置引脚的响应时间=1/100MHz .
+	//从高电平切换到低电平1/100MHz,速度越快，功耗会越高
+	GPIO_InitStructure.GPIO_OType = GPIO_OType_PP ;//推挽的输出模式，增加输出电流和灌电流的能力
+	GPIO_InitStructure.GPIO_PuPd  = GPIO_PuPd_NOPULL ;//不使能内部上下拉电阻
+	GPIO_Init(GPIOE ,&GPIO_InitStructure);
+	
+	//将PE13连接到TIM1
+	GPIO_PinAFConfig(GPIOE, GPIO_PinSource13, GPIO_AF_TIM1);	
+	
+	tim1_init();
+	
+	GPIO_InitStructure.GPIO_Pin  = GPIO_Pin_9;
+	GPIO_Init(GPIOF ,&GPIO_InitStructure);
+	
+	//将PF9连接到TIM14
+	GPIO_PinAFConfig(GPIOF, GPIO_PinSource9, GPIO_AF_TIM14);
+	
+	tim14_init();
+
+	GPIO_InitStructure.GPIO_Pin  = GPIO_Pin_8;// PF8 蜂鸣器
+	GPIO_InitStructure.GPIO_Mode = GPIO_Mode_OUT ;//配置为输出模式	
+	GPIO_Init(GPIOF ,&GPIO_InitStructure);
+	
+	PFout(8)=0;
+	
+	//初始化串口1的波特率为115200bps
+	//注意：如果接收的数据是乱码，要检查PLL。
+	usart1_init(115200);
+	
+	//串口3的波特率为9600bps，因为蓝牙模块默认使用该波特率
+	usart3_init(9600);
+	
+	delay_ms(100);
+
+	printf("This is Bluetooth test\r\n");
+	
+
+	usart3_send_str("AT+NAMEYaojunwei\r\n");
+	
+	
+	while(1)
+	{
+		
+		// 当接收完成一次数据时
+		if (g_usart3_event)
+		{
+		
+			if (strstr((char*)g_usart3_buf, "duty=")) // 判断是否修改占空比
+			{
+				s = strtok(g_usart3_buf, "="); // s = "duty"
+				
+				s = strtok(NULL, "="); // 这里获取到控制哪个LED灯
+				duty_num = atoi(s);
+
+				s = strtok(NULL, "="); // 这里获取到占空比
+				duty_tmp = atoi(s);
+				
+				if (duty_num == 0)
+				{
+					tim14_set_duty(duty_tmp);
+					printf("duty set led%d %d ok\r\n", duty_num, duty_tmp);
+				}
+				else if (duty_num == 2)
+				{
+					tim1_set_duty(duty_tmp);
+					printf("duty set led%d %d ok\r\n", duty_num, duty_tmp);
+				}
+				
+			}
+			else if (strstr((char*)g_usart3_buf, "beep=")) // 蜂鸣器开/关
+			{
+				s = strtok(g_usart3_buf, "=");
+				s = strtok(NULL, "=");
+				
+				if (strstr(s, "on"))
+				{
+					PFout(8)=1;
+				}
+				else if (strstr(s, "off"))
+				{
+					PFout(8)=0;
+				}
+				
+				printf("beep %s ok\r\n", s);
+				
+			}
+			else if (strstr((char*)g_usart3_buf, "temp?") != NULL) // 查询温度
+			{
+				
+			}
+			else if (strstr((char*)g_usart3_buf, "humi?") != NULL) // 查询湿度
+			{
+				
+			}					
+			
+			memset((void *)g_usart3_buf, 0, sizeof(g_usart3_buf));
+			g_usart3_cnt = 0;
+			g_usart3_event = 0;
+		}
+
+		
+	}
+	
+	return 0 ;
+}
+
+
+
+void USART1_IRQHandler(void)
+{
+
+	uint8_t d;
+	
+	//检测是否接收到数据
+	if(USART_GetITStatus(USART1,USART_IT_RXNE)==SET)
+	{
+		d = USART_ReceiveData(USART1);
+		
+		g_usart3_buf[g_usart3_cnt] = d;
+		
+		g_usart3_cnt++;
+		
+		if ((d == '#') || (g_usart3_cnt > sizeof(g_usart3_buf)))
+		{
+			g_usart3_event = 1;
+		}
+
+		//清空标志位，告诉CPU当前数据接收完毕，可以接收新的数据
+		USART_ClearITPendingBit(USART1,USART_IT_RXNE);
+	
+	}
+}
+
+void USART3_IRQHandler(void)
+{
+
+	uint8_t d;
+	
+	//检测是否接收到数据
+	if(USART_GetITStatus(USART3,USART_IT_RXNE)==SET)
+	{
+		d = USART_ReceiveData(USART3);
+		
+		g_usart3_buf[g_usart3_cnt] = d;
+		
+		g_usart3_cnt++;
+		
+		if ((d == '#') || (g_usart3_cnt > sizeof(g_usart3_buf)))
+		{
+			g_usart3_event = 1;
+		}
+		
+		//清空标志位，告诉CPU当前数据接收完毕，可以接收新的数据
+		USART_ClearITPendingBit(USART3,USART_IT_RXNE);
+	
+	}
+}
+
